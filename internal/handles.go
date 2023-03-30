@@ -568,12 +568,12 @@ func (inode *Inode) getXattrMap(name string, userOnly bool) (
 		if userOnly {
 			return nil, "", syscall.EPERM
 		} else {
-			return nil, "", unix.ENODATA
+			return nil, "", unix.ENOSYS
 		}
 	}
 
 	if meta == nil {
-		return nil, "", unix.ENODATA
+		return nil, "", unix.ENOSYS
 	}
 
 	return
