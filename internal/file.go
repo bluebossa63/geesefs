@@ -130,7 +130,7 @@ func (inode *Inode) appendBuffer(buf *FileBuffer, data []byte) int64 {
 	return allocated
 }
 
-func (inode *Inode) insertBuffer(pos int, offset uint64, data []byte, state int16, copyData bool, dataPtr *BufferPointer) int64 {
+func (inode *Inode) insertOrAppendBuffer(pos int, offset uint64, data []byte, state int16, copyData bool, dataPtr *BufferPointer) int64 {
 	allocated := int64(0)
 	dirtyID := uint64(0)
 	if state == BUF_DIRTY {
@@ -230,13 +230,13 @@ func (inode *Inode) addBuffer(offset uint64, data []byte, state int16, copyData 
 			if nextEnd > endOffset {
 				nextEnd = endOffset
 			}
-			allocated += inode.insertBuffer(pos, curOffset, data[curOffset-offset : nextEnd-offset], state, copyData, dataPtr)
+			allocated += inode.insertOrAppendBuffer(pos, curOffset, data[curOffset-offset : nextEnd-offset], state, copyData, dataPtr)
 		}
 		curOffset = b.offset + b.length
 	}
 	if curOffset < endOffset {
 		// Insert curOffset->endOffset
-		allocated += inode.insertBuffer(pos, curOffset, data[curOffset-offset : ], state, copyData, dataPtr)
+		allocated += inode.insertOrAppendBuffer(pos, curOffset, data[curOffset-offset : ], state, copyData, dataPtr)
 	}
 
 	return allocated
@@ -456,6 +456,13 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte, copyData bool) (err e
 	fh.inode.fs.lfru.Hit(fh.inode.Id, 0)
 
 	fh.inode.mu.Lock()
+
+	if fh.inode.CacheState == ST_DELETED || fh.inode.CacheState == ST_DEAD {
+		// Oops, it's a deleted file. We don't support changing invisible files
+		fh.inode.fs.bufferPool.Use(-int64(len(data)), false)
+		fh.inode.mu.Unlock()
+		return fuse.ENOENT
+	}
 
 	fh.inode.checkPauseWriters()
 
@@ -1161,7 +1168,7 @@ func (fh *FileHandle) Release() {
 	if n == -1 {
 		panic(fmt.Sprintf("Released more file handles than acquired, n = %v", n))
 	}
-	if n == 0 && atomic.LoadInt32(&fh.inode.CacheState) == ST_CACHED {
+	if n == 0 && atomic.LoadInt32(&fh.inode.CacheState) <= ST_DEAD {
 		fh.inode.Parent.addModified(-1)
 	}
 	fh.inode.fs.WakeupFlusher()
@@ -1329,7 +1336,7 @@ func (inode *Inode) SendUpload() bool {
 						err = nil
 						notFoundIgnore = true
 					} else if mappedErr == fuse.ENOENT || mappedErr == syscall.ERANGE {
-						s3Log.Warnf("Conflict detected: failed to copy %v to %v: %v. File is removed remotely, dropping cache", from, key, err)
+						s3Log.Warnf("Conflict detected (inode %v): failed to copy %v to %v: %v. File is removed remotely, dropping cache", inode.Id, from, key, err)
 						inode.mu.Lock()
 						newParent := inode.Parent
 						oldParent := inode.oldParent
@@ -1475,7 +1482,7 @@ func (inode *Inode) SendUpload() bool {
 					inode.userMetadataDirty = 2
 					if mappedErr == fuse.ENOENT || mappedErr == syscall.ERANGE {
 						// Object is deleted or resized remotely (416). Discard local version
-						log.Warnf("Conflict detected: File %v is deleted or resized remotely, discarding local changes", inode.FullName())
+						s3Log.Warnf("Conflict detected (inode %v): File %v is deleted or resized remotely, discarding local changes", inode.Id, inode.FullName())
 						inode.resetCache()
 					}
 					log.Errorf("Error flushing metadata using COPY for %v: %v", key, err)
@@ -1494,7 +1501,7 @@ func (inode *Inode) SendUpload() bool {
 
 	if inode.Attributes.Size <= inode.fs.flags.SinglePartMB*1024*1024 && inode.mpu == nil {
 		// Don't flush small files with active file handles (if not under memory pressure)
-		if inode.IsFlushing == 0 && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.bufferPool.wantFree) > 0) {
+		if inode.IsFlushing == 0 && (inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0) {
 			// Don't accidentally trigger a parallel multipart flush
 			inode.IsFlushing += inode.fs.flags.MaxParallelParts
 			atomic.AddInt64(&inode.fs.activeFlushers, 1)
@@ -1543,7 +1550,7 @@ func (inode *Inode) SendUpload() bool {
 	// Pick part(s) to flush
 	initiated := false
 	lastPart := uint64(0)
-	flushInode := inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.bufferPool.wantFree) > 0
+	flushInode := inode.fileHandles == 0 || inode.forceFlush || atomic.LoadInt32(&inode.fs.wantFree) > 0
 	partDirty := false
 	partLocked := false
 	partEvicted := false
@@ -1624,7 +1631,7 @@ func (inode *Inode) SendUpload() bool {
 		}
 	}
 	if canComplete && (inode.fileHandles == 0 || inode.forceFlush ||
-		atomic.LoadInt32(&inode.fs.bufferPool.wantFree) > 0 && hasEvictedParts) {
+		atomic.LoadInt32(&inode.fs.wantFree) > 0 && hasEvictedParts) {
 		// Complete the multipart upload
 		inode.IsFlushing += inode.fs.flags.MaxParallelParts
 		atomic.AddInt64(&inode.fs.activeFlushers, 1)
@@ -1719,7 +1726,7 @@ func (inode *Inode) FlushSmallObject() {
 		mappedErr := mapAwsError(err)
 		if mappedErr == fuse.ENOENT || mappedErr == syscall.ERANGE {
 			// Object is deleted or resized remotely (416). Discard local version
-			log.Warnf("Conflict detected: File %v is deleted or resized remotely, discarding local changes", inode.FullName())
+			s3Log.Warnf("Conflict detected (inode %v): File %v is deleted or resized remotely, discarding local changes", inode.Id, inode.FullName())
 			inode.resetCache()
 			inode.IsFlushing -= inode.fs.flags.MaxParallelParts
 			atomic.AddInt64(&inode.fs.activeFlushers, -1)
@@ -1773,7 +1780,7 @@ func (inode *Inode) FlushSmallObject() {
 			inode.userMetadataDirty = 2
 		}
 	} else {
-		log.Debugf("Flushed small file %v: etag=%v, size=%v", key, NilStr(resp.ETag), sz)
+		log.Debugf("Flushed small file %v (inode %v): etag=%v, size=%v", key, inode.Id, NilStr(resp.ETag), sz)
 		stillDirty := inode.userMetadataDirty != 0 || inode.oldParent != nil
 		for i := 0; i < len(inode.buffers); i++ {
 			b := inode.buffers[i]
@@ -1792,9 +1799,6 @@ func (inode *Inode) FlushSmallObject() {
 				inode.SetCacheState(ST_CACHED)
 			} else {
 				inode.SetCacheState(ST_MODIFIED)
-			}
-			if atomic.LoadInt32(&inode.fs.bufferPool.wantFree) > 0 {
-				inode.fs.bufferPool.cond.Broadcast()
 			}
 		}
 		inode.updateFromFlush(sz, resp.ETag, resp.LastModified, resp.StorageClass)
@@ -1920,7 +1924,7 @@ func (inode *Inode) FlushPart(part uint64) {
 		mappedErr := mapAwsError(err)
 		if mappedErr == fuse.ENOENT || mappedErr == syscall.ERANGE {
 			// Object is deleted or resized remotely (416). Discard local version
-			log.Warnf("Conflict detected: File %v is deleted or resized remotely, discarding local changes", inode.FullName())
+			s3Log.Warnf("Conflict detected (inode %v): File %v is deleted or resized remotely, discarding local changes", inode.Id, inode.FullName())
 			inode.resetCache()
 			return
 		}
@@ -1984,9 +1988,6 @@ func (inode *Inode) FlushPart(part uint64) {
 				}
 			}
 		}
-		if atomic.LoadInt32(&inode.fs.bufferPool.wantFree) > 0 {
-			inode.fs.bufferPool.cond.Broadcast()
-		}
 	}
 }
 
@@ -2007,7 +2008,7 @@ func (inode *Inode) completeMultipart() {
 	mappedErr := mapAwsError(err)
 	if mappedErr == fuse.ENOENT || mappedErr == syscall.ERANGE {
 		// Object is deleted or resized remotely (416). Discard local version
-		log.Warnf("Conflict detected: File %v is deleted or resized remotely, discarding local changes", inode.FullName())
+		s3Log.Warnf("Conflict detected (inode %v): File %v is deleted or resized remotely, discarding local changes", inode.Id, inode.FullName())
 		inode.resetCache()
 		return
 	}
@@ -2062,9 +2063,6 @@ func (inode *Inode) completeMultipart() {
 					} else {
 						inode.SetCacheState(ST_MODIFIED)
 					}
-					if atomic.LoadInt32(&inode.fs.bufferPool.wantFree) > 0 {
-						inode.fs.bufferPool.cond.Broadcast()
-					}
 				}
 			}
 		}
@@ -2094,7 +2092,7 @@ func (inode *Inode) SyncFile() (err error) {
 	for {
 		inode.mu.Lock()
 		inode.forceFlush = false
-		if inode.CacheState == ST_CACHED {
+		if inode.CacheState <= ST_DEAD {
 			inode.mu.Unlock()
 			break
 		}
